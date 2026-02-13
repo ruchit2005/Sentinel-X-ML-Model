@@ -5,7 +5,7 @@ Core model class for fraud detection combining Rule-Based + Isolation Forest
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     classification_report, 
@@ -54,9 +54,11 @@ class HybridFraudDetector:
         self.random_state = random_state
         self.verbose = verbose
         
-        # Models
+        # Models (Ensemble Approach)
         self.isolation_forest = None
+        self.random_forest = None  # Supervised classifier for ensemble
         self.scaler = StandardScaler()
+        self.use_ensemble = True  # Use ensemble by default
         
         # Feature configuration
         self.feature_columns = [
@@ -76,7 +78,7 @@ class HybridFraudDetector:
         
     def apply_hard_rule(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Stage 1: Hard Rule Filter (Enhanced with 3 rules)
+        Stage 1: Hard Rule Filter (Enhanced with 5 rules)
         
         Rule 1: Delivery Partner Protection
             If callFrequency > 50 AND avgCallDistance < 10
@@ -89,6 +91,14 @@ class HybridFraudDetector:
         Rule 3: Obvious Digital Arrest Bot
             If avgCallDistance > 1500 AND circleDiversity >= 6 AND avgDuration < 15
             Then: FRAUD with 99% confidence
+        
+        Rule 4: Low Volume Scammer (NEW)
+            If callFrequency BETWEEN 30-50 AND avgCallDistance > 900 AND circleDiversity >= 4 AND avgDuration < 100 AND contact_circle_ratio < 15
+            Then: FRAUD with 95% confidence
+        
+        Rule 5: Traditional Scammer (NEW)
+            If callFrequency BETWEEN 35-70 AND circleDiversity >= 3 AND avgDuration BETWEEN 15-80 AND contact_circle_ratio < 15
+            Then: FRAUD with 92% confidence
         
         Returns:
             filtered_safe: Records marked by hard rules
@@ -130,6 +140,41 @@ class HybridFraudDetector:
             rule3_matches['riskType'] = 'DIGITAL_ARREST_BOT'
             rule3_matches['detection_stage'] = 'RULE_BASED'
             filtered_fraud = pd.concat([filtered_fraud, rule3_matches])
+        
+        # Rule 4: Low Volume Scammer (MID FREQUENCY + LONG DISTANCE + MULTIPLE CIRCLES + SHORT CALLS)
+        # Data shows: freq 31-49, distance 906-1774km, circles 4-6
+        # Duration filter < 100 excludes Business Users (101s) and Traveling Professionals (145s)
+        # contact_circle_ratio < 15 excludes Business Users (18.05) who call same people repeatedly
+        rule4_mask = (~rule1_mask) & (~rule2_mask) & (~rule3_mask) & \
+                     (df['callFrequency'] >= 30) & (df['callFrequency'] <= 50) & \
+                     (df['avgCallDistance'] > 900) & \
+                     (df['circleDiversity'] >= 4) & \
+                     (df['avgDuration'] < 100) & \
+                     (df['contact_circle_ratio'] < 15)
+        rule4_matches = df[rule4_mask].copy()
+        if len(rule4_matches) > 0:
+            rule4_matches['prediction'] = 'FRAUD'
+            rule4_matches['confidence'] = 0.95
+            rule4_matches['riskType'] = 'LOW_VOLUME_SCAMMER'
+            rule4_matches['detection_stage'] = 'RULE_BASED'
+            filtered_fraud = pd.concat([filtered_fraud, rule4_matches])
+        
+        # Rule 5: Traditional Scammer (MID-HIGH FREQUENCY + MODERATE DURATION + LOWER CIRCLES)
+        # Data shows: freq 35-69, duration 53s avg (15-90 range), circles 3-5
+        # Duration filter < 80 excludes Business Users (101s) while catching Traditional Scammers (53s)
+        # contact_circle_ratio < 15 excludes Business Users (18.05)
+        rule5_mask = (~rule1_mask) & (~rule2_mask) & (~rule3_mask) & (~rule4_mask) & \
+                     (df['callFrequency'] >= 35) & (df['callFrequency'] <= 70) & \
+                     (df['circleDiversity'] >= 3) & \
+                     (df['avgDuration'] >= 15) & (df['avgDuration'] < 80) & \
+                     (df['contact_circle_ratio'] < 15)
+        rule5_matches = df[rule5_mask].copy()
+        if len(rule5_matches) > 0:
+            rule5_matches['prediction'] = 'FRAUD'
+            rule5_matches['confidence'] = 0.92
+            rule5_matches['riskType'] = 'TRADITIONAL_SCAMMER'
+            rule5_matches['detection_stage'] = 'RULE_BASED'
+            filtered_fraud = pd.concat([filtered_fraud, rule5_matches])
         
         # Combine all rule-based decisions
         all_rule_based = pd.concat([filtered_safe, filtered_fraud])
@@ -204,6 +249,23 @@ class HybridFraudDetector:
         
         self.isolation_forest.fit(X_train_scaled)
         print("  ✅ Isolation Forest training complete!")
+        
+        # Stage 3: Train Random Forest (Ensemble Component)
+        if self.use_ensemble:
+            print("\n🌳 STAGE 3: Random Forest Training (Ensemble)")
+            print("-" * 70)
+            print(f"  🌲 Training Random Forest (100 estimators)...")
+            self.random_forest = RandomForestClassifier(
+                n_estimators=100,
+                max_depth=8,
+                min_samples_split=20,
+                class_weight='balanced',
+                random_state=self.random_state,
+                n_jobs=-1
+            )
+            self.random_forest.fit(X_train_scaled, y_train)
+            print("  ✅ Random Forest training complete!")
+            print("  ✅ Ensemble model ready!")
         
         # Make predictions on training set
         print("\n📊 Evaluating training performance...")
@@ -302,40 +364,78 @@ class HybridFraudDetector:
         # Stage 1: Hard rule
         rule_safe, remaining = self.apply_hard_rule(df)
         
-        # Stage 2: ML predictions for remaining
+        # Stage 2: ML predictions for remaining (with Ensemble)
         if len(remaining) > 0:
             X_remaining = self.prepare_features(remaining)
             X_remaining_scaled = self.scaler.transform(X_remaining)
             
-            # Predict (-1 = anomaly/fraud, 1 = normal/legitimate)
-            ml_predictions = self.isolation_forest.predict(X_remaining_scaled)
-            
-            # Get anomaly scores (more negative = more anomalous)
+            # Get Isolation Forest predictions
+            iso_predictions = self.isolation_forest.predict(X_remaining_scaled)
             anomaly_scores = self.isolation_forest.decision_function(X_remaining_scaled)
             
-            # Convert to predictions
-            remaining['prediction'] = np.where(ml_predictions == -1, 'FRAUD', 'LEGITIMATE')
-            remaining['anomaly_score'] = anomaly_scores
-            
-            # Calculate confidence (normalize anomaly scores to 0-1)
-            min_score = anomaly_scores.min()
-            max_score = anomaly_scores.max()
-            normalized_scores = (anomaly_scores - min_score) / (max_score - min_score + 1e-6)
-            
-            # For fraud: higher anomaly = higher confidence
-            # For legitimate: lower anomaly = higher confidence
-            remaining['confidence'] = np.where(
-                ml_predictions == -1,
-                1 - normalized_scores,  # Fraud: more anomalous = more confident
-                normalized_scores        # Legitimate: less anomalous = more confident
-            )
-            
-            remaining['riskType'] = np.where(
-                ml_predictions == -1,
-                'HIGH_RISK_ANOMALY',
-                'NORMAL_PATTERN'
-            )
-            remaining['detection_stage'] = 'ML_ISOLATION_FOREST'
+            # Use ensemble if Random Forest is trained
+            if self.use_ensemble and self.random_forest is not None:
+                # Get Random Forest predictions
+                rf_predictions = self.random_forest.predict(X_remaining_scaled)
+                rf_proba = self.random_forest.predict_proba(X_remaining_scaled)[:, 1]
+                
+                # Normalize anomaly scores (higher = more anomalous)
+                iso_score_norm = (anomaly_scores - anomaly_scores.min()) / \
+                                (anomaly_scores.max() - anomaly_scores.min() + 1e-6)
+                iso_fraud_score = 1 - iso_score_norm  # Convert to fraud probability
+                
+                # Weighted ensemble: RF (60%) + ISO (40%)
+                # RF is supervised so gets higher weight
+                ensemble_score = rf_proba * 0.6 + iso_fraud_score * 0.4
+                
+                # Decision threshold: 0.50 for balanced precision/recall
+                # Lower threshold (0.45) would increase recall, higher (0.60) increases precision
+                ensemble_fraud = ensemble_score > 0.50
+                
+                # Convert to predictions
+                remaining['prediction'] = np.where(ensemble_fraud, 'FRAUD', 'LEGITIMATE')
+                
+                # Confidence is the ensemble score itself
+                remaining['confidence'] = np.where(
+                    ensemble_fraud,
+                    ensemble_score,
+                    1 - ensemble_score
+                )
+                
+                remaining['riskType'] = np.where(
+                    ensemble_fraud,
+                    'HIGH_RISK_ENSEMBLE',
+                    'NORMAL_PATTERN'
+                )
+                remaining['detection_stage'] = 'ML_ENSEMBLE'
+                
+            else:
+                # Fallback: Use Isolation Forest only
+                ml_predictions = iso_predictions
+                
+                # Convert to predictions
+                remaining['prediction'] = np.where(ml_predictions == -1, 'FRAUD', 'LEGITIMATE')
+                remaining['anomaly_score'] = anomaly_scores
+                
+                # Calculate confidence (normalize anomaly scores to 0-1)
+                min_score = anomaly_scores.min()
+                max_score = anomaly_scores.max()
+                normalized_scores = (anomaly_scores - min_score) / (max_score - min_score + 1e-6)
+                
+                # For fraud: higher anomaly = higher confidence
+                # For legitimate: lower anomaly = higher confidence
+                remaining['confidence'] = np.where(
+                    ml_predictions == -1,
+                    1 - normalized_scores,  # Fraud: more anomalous = more confident
+                    normalized_scores        # Legitimate: less anomalous = more confident
+                )
+                
+                remaining['riskType'] = np.where(
+                    ml_predictions == -1,
+                    'HIGH_RISK_ANOMALY',
+                    'NORMAL_PATTERN'
+                )
+                remaining['detection_stage'] = 'ML_ISOLATION_FOREST'
         
         # Combine results
         if len(rule_safe) > 0 and len(remaining) > 0:
@@ -355,6 +455,10 @@ class HybridFraudDetector:
         
         # Save Isolation Forest
         joblib.dump(self.isolation_forest, f'{model_dir}/isolation_forest.pkl')
+        
+        # Save Random Forest (if trained)
+        if self.random_forest is not None:
+            joblib.dump(self.random_forest, f'{model_dir}/random_forest.pkl')
         
         # Save scaler
         joblib.dump(self.scaler, f'{model_dir}/scaler.pkl')
@@ -382,6 +486,7 @@ class HybridFraudDetector:
             'contamination': self.contamination,
             'max_samples': self.max_samples,
             'random_state': self.random_state,
+            'use_ensemble': self.use_ensemble,
             'training_stats': convert_to_native(self.training_stats)
         }
         
@@ -390,13 +495,26 @@ class HybridFraudDetector:
         
         print(f"\n💾 Model saved to '{model_dir}/' directory")
         print(f"  ✓ isolation_forest.pkl")
+        if self.random_forest is not None:
+            print(f"  ✓ random_forest.pkl")
         print(f"  ✓ scaler.pkl")
         print(f"  ✓ config.json")
     
     def load_model(self, model_dir: str = 'models'):
         """Load trained model and scaler"""
+        import os
+        
         # Load Isolation Forest
         self.isolation_forest = joblib.load(f'{model_dir}/isolation_forest.pkl')
+        
+        # Load Random Forest (if exists)
+        rf_path = f'{model_dir}/random_forest.pkl'
+        if os.path.exists(rf_path):
+            self.random_forest = joblib.load(rf_path)
+            print(f"  ✓ Loaded Random Forest ensemble model")
+        else:
+            self.random_forest = None
+            self.use_ensemble = False
         
         # Load scaler
         self.scaler = joblib.load(f'{model_dir}/scaler.pkl')
@@ -410,6 +528,7 @@ class HybridFraudDetector:
         self.contamination = config['contamination']
         self.max_samples = config['max_samples']
         self.random_state = config['random_state']
+        self.use_ensemble = config.get('use_ensemble', True)
         self.training_stats = config.get('training_stats', {})
         
         print(f"✅ Model loaded from '{model_dir}/' directory")

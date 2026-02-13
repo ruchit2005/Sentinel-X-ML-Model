@@ -27,8 +27,8 @@ def main():
     # Step 2: Initialize model
     with tqdm(total=100, desc="⚙️  Initializing Model", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}") as pbar:
         detector = HybridFraudDetector(
-            n_estimators=100,      # Fast training with good performance
-            contamination=0.18,    # Reduced for better precision
+            n_estimators=150,      # Increased for better performance
+            contamination=0.18,    # Tuned for better precision/recall balance
             max_samples=256,       # Speed optimization
             random_state=42,
             verbose=0              # Keep output clean
